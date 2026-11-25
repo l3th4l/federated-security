@@ -1,0 +1,6 @@
+datasets==5.2.0
+flwr==1.44.0
+flwr_datasets==0.6.1
+torch==2.15.0
+torchvision==0.29.2
+

@@ -6,88 +6,178 @@ from pyexpat import features
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.func import functional_call
 from datasets import load_dataset
 from flwr_datasets import FederatedDataset
 from flwr_datasets.partitioner import IidPartitioner
 from torch.utils.data import DataLoader
 from torchvision.transforms import Compose, Normalize, ToTensor
 
+# Helper functions 
+def cosine_distance(weight_diff, weight_diff_sim):
 
-def attack(model_server, model_client, learning_rate, batch_size_client, epoch):
+    # Flatten and concatenate all parameter differences
+    w_true = torch.cat([
+        tensor.reshape(-1)
+        for tensor in weight_diff.values()
+    ])
 
-    weights_server = model_server.state_dict()
-    weights_client = model_client.state_dict() 
+    w_sim = torch.cat([
+        tensor.reshape(-1)
+        for tensor in weight_diff_sim.values()
+    ])
 
-    weight_diff = {} 
+    # Cosine distance
+    return 1 - F.cosine_similarity(w_true, w_sim, dim=0)
 
-    for name in weights_server: 
-        weight_diff[name] = weights_server[name] - weights_client[name]
 
-    converged = False
+# attack
+
+def rand_init(num_samples, input_shape, epochs, batch_size, device, mode="noise", dataset=None):
+    num_batches = math.ceil(num_samples / batch_size)
+
+    dummy_batches = []
+
+    for epoch in range(epochs):
+        epoch_batches = []
+
+        for batch in range(num_batches):
+            current_batch_size = min(batch_size, num_samples - batch * batch_size)
+
+            if mode == "noise":
+                # Random initialisation in [0, 1]
+                x = torch.rand(current_batch_size, *input_shape, device=device)
+
+            elif mode == "dataset":
+                if dataset is None:
+                    raise ValueError("A dataset must be provided when mode='dataset'")
+
+                indices = torch.randint(low=0, high=len(dataset), size=(current_batch_size,))
+
+                x = torch.stack([dataset[i][0] for i in indices]).to(device)
+
+            else:
+                raise ValueError(f"Unknown mode: {mode}")
+
+            epoch_batches.append(nn.Parameter(x))
+
+        dummy_batches.append(epoch_batches)
+
+    return dummy_batches
+
+def attack(model_server, model_client, learning_rate, batch_size_client, labels, epoch, init_mode="noise", dataset=None, input_shape=(3, 32, 32)):
+    # Original server parameters
+    params_server = {
+        name: param.detach().clone()
+        for name, param in model_server.named_parameters()
+    }
+
+    # Final client parameters
+    params_client = {
+        name: param.detach().clone()
+        for name, param in model_client.named_parameters()
+    }
+
+    # True parameter difference
+    weight_diff = {
+        name: params_server[name] - params_client[name]
+        for name in params_server
+    }
+    
+    # Initialize dummy features and labels
+    num_samples = len(labels)
+    
+    dummy_batches = rand_init(
+        num_samples=num_samples,
+        input_shape=input_shape,
+        epochs=epoch,
+        batch_size=batch_size_client,
+        device=next(model_server.parameters()).device,
+        mode=init_mode,
+        dataset=dataset,
+    )
+
+    label_batches = [labels[i:i + batch_size_client] for i in range(0, num_samples, batch_size_client)]
+
+    optimizer = torch.optim.Adam([x for epoch_batches in dummy_batches for x in epoch_batches], lr=0.1)
+    
+    # TODO Add convergence criterion
+    #converged = False
     #get sim features, sim labels
+    
+    max_iter = 1000
 
-    while not converged:
+    #while not converged:
+    for i in range(max_iter):
+        optimizer.zero_grad()
+
         #change to sim features and sim labels
-        model_sim_client = sim_update(features, labels, model_server, learning_rate, batch_size_client, epoch)
-        #calculate sim wweight diff 
-        #calcuclate loss = loss_sim(weight_diff, sim_weight_diff) + loss_inv(sim_features) 
-        #update sim_features
+        params_sim = sim_update(dummy_batches, label_batches, model_server, learning_rate, epoch)
+                
+        #calculate sim weight diff 
+        weight_diff_sim = {
+            name: params_server[name] - params_sim[name]
+            for name in params_server
+        }
 
-    pass
+        # Similarity loss
+        loss_sim = cosine_distance(
+            weight_diff,
+            weight_diff_sim
+        )
 
-def sim_update(features, labels, model_server, learning_rate, batch_size_client, epoch):
-    N = features.shape[0]
+        # Add epoch-invariant prior later
+        loss = loss_sim  # + lambda_inv * loss_inv(features_sim)
 
-    num_batches = math.ceil(N / batch_size_client)
+        # Backpropagate into dummy inputs
+        loss.backward()
 
-    weights_server = model_server.state_dict()
-    weights_init = {} 
-    for name in weights_server: 
-        weights_init[name] = weights_server[name].detach().clone()
+        optimizer.step()
 
-    model_client = copy.deepcopy(model_server)
-    model_client.load_state_dict(weights_init)
+    return dummy_batches
+
+def sim_update(dummy_batches, label_batches, model_server, learning_rate, epoch):
+
+    # Initial parameters (keep them as constants)
+    params = {
+        name: param.detach().clone().requires_grad_(True)
+        for name, param in model_server.named_parameters()
+    }
+
+    # Model buffers (e.g. BatchNorm running statistics)
+    buffers = {
+        name: buf.detach().clone()
+        for name, buf in model_server.named_buffers()
+    }
 
     loss_fn = nn.CrossEntropyLoss()
 
-    # partition data into batches
-    batch_indices = partition_data(features, batch_size_client)
-
     for e in range(epoch):
-        for b in range(num_batches):
+        for b in range(len(dummy_batches[e])):
 
             #get batch 
-            idx = batch_indices[b]
-            x_batch = features[idx] 
-            y_batch = labels[idx] 
-
-            # calculate gradient
-            model_client.zero_grad()
-
-            outputs = model_client(x_batch)
+            x_batch = dummy_batches[e][b]
+            y_batch = label_batches[b]
+            
+            # calls the server model but with the parameters oof our simulated client 
+            outputs = functional_call(model_server, (params, buffers), (x_batch,))
             loss = loss_fn(outputs, y_batch)
 
-            loss.backwards()
+            # loss.backwards() detaches the gradients 
+            # Extract gradients while preserving the graph
+            gradients = torch.autograd.grad(
+                loss,
+                tuple(params.values()),
+                create_graph=True
+            )
 
-            # Extract gradients
-            gradients = {
-                name: param.grad.detach().clone()
-                for name, param in model_client.named_parameters()
-            }
-
-            # Update weights
-            with torch.no_grad():
-                for name, param in model_client.named_parameters():
-                    param -= learning_rate * gradients[name]   
+            # Differentiable SGD update
+            params = {
+                name: param - learning_rate * grad
+                for (name, param), grad
+                in zip(params.items(), gradients)
+            }  
 
     # return weights
-    return model_client.state_dict()
+    return params 
 
-
-def partition_data(features, batch_size_client):
-    N = features.shape[0]
-
-    indices = torch.randperm(N)
-    chunks = indices.split(batch_size_client)
-
-    return chunks
